@@ -1,0 +1,618 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "storageAccount": {
+      "type": "String",
+      "defaultValue": "<storage-account-name>"
+    },
+    "stateTable": {
+      "type": "String",
+      "defaultValue": "AutonomyState"
+    },
+    "auditTable": {
+      "type": "String",
+      "defaultValue": "AgentAudit"
+    },
+    "actorUrl": {
+      "type": "String",
+      "defaultValue": "https://<aoai-resource>.openai.azure.com/openai/deployments/<actor-deployment>/chat/completions?api-version=2024-10-21"
+    },
+    "auditorUrl": {
+      "type": "String",
+      "defaultValue": "https://<aoai-resource>.openai.azure.com/openai/deployments/<auditor-deployment>/chat/completions?api-version=2024-10-21"
+    },
+    "auditorIdentity": {
+      "type": "String",
+      "defaultValue": "/subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/<auditor-identity-name>"
+    },
+    "minAudits": {
+      "type": "Int",
+      "defaultValue": 20
+    },
+    "windowAudits": {
+      "type": "Int",
+      "defaultValue": 50
+    },
+    "promoteBelow": {
+      "type": "Float",
+      "defaultValue": 0.02
+    },
+    "demoteAbove": {
+      "type": "Float",
+      "defaultValue": 0.05
+    },
+    "demoMode": {
+      "type": "Bool",
+      "defaultValue": false
+    },
+    "teamsWebhookUrl": {
+      "type": "SecureString"
+    }
+  },
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "required": [
+            "workflowName",
+            "actionClass",
+            "task"
+          ],
+          "properties": {
+            "workflowName": {
+              "type": "string"
+            },
+            "actionClass": {
+              "type": "string",
+              "enum": [
+                "reversible",
+                "irreversible"
+              ]
+            },
+            "task": {
+              "type": "string"
+            },
+            "forceVerdict": {
+              "type": "string",
+              "enum": [
+                "pass",
+                "fail"
+              ]
+            }
+          }
+        }
+      },
+      "runtimeConfiguration": {
+        "concurrency": {
+          "runs": 1
+        }
+      }
+    }
+  },
+  "actions": {
+    "Init_Verdict": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "verdict",
+            "type": "string",
+            "value": "skipped"
+          }
+        ]
+      },
+      "runAfter": {}
+    },
+    "Init_Verdict_Reason": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "verdictReason",
+            "type": "string",
+            "value": ""
+          }
+        ]
+      },
+      "runAfter": {
+        "Init_Verdict": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Init_Outcome": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "outcome",
+            "type": "string",
+            "value": "pending"
+          }
+        ]
+      },
+      "runAfter": {
+        "Init_Verdict_Reason": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Get_State": {
+      "type": "Http",
+      "inputs": {
+        "method": "GET",
+        "uri": "@{concat('https://', parameters('storageAccount'), '.table.core.windows.net/', parameters('stateTable'), '(PartitionKey=''', triggerBody()?['workflowName'], ''',RowKey=''state'')')}",
+        "headers": {
+          "Accept": "application/json;odata=nometadata",
+          "Content-Type": "application/json",
+          "x-ms-version": "2019-02-02",
+          "x-ms-date": "@{utcNow('R')}"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com/"
+        }
+      },
+      "runAfter": {
+        "Init_Outcome": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Parse_State": {
+      "type": "ParseJson",
+      "inputs": {
+        "content": "@body('Get_State')",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "sampleRate": {
+              "type": "integer"
+            },
+            "audits": {
+              "type": "integer"
+            },
+            "disagreements": {
+              "type": "integer"
+            },
+            "killSwitch": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "runAfter": {
+        "Get_State": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Check_Kill_Switch": {
+      "type": "If",
+      "expression": {
+        "equals": [
+          "@body('Parse_State')?['killSwitch']",
+          true
+        ]
+      },
+      "actions": {
+        "Reject_Kill_Switch": {
+          "type": "Response",
+          "kind": "Http",
+          "inputs": {
+            "statusCode": 503,
+            "body": {
+              "outcome": "blocked_by_kill_switch"
+            }
+          },
+          "runAfter": {}
+        },
+        "Terminate_Kill_Switch": {
+          "type": "Terminate",
+          "inputs": {
+            "runStatus": "Cancelled"
+          },
+          "runAfter": {
+            "Reject_Kill_Switch": [
+              "Succeeded"
+            ]
+          }
+        }
+      },
+      "else": {
+        "actions": {}
+      },
+      "runAfter": {
+        "Parse_State": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Call_Actor": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "@parameters('actorUrl')",
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are the actor agent in an automated workflow. Decide how to handle the task. Reply with JSON only, in this shape: {\"decision\": string, \"confidence\": number between 0 and 1, \"rationale\": string}. Be honest about uncertainty. Low confidence is better than a confident guess."
+            },
+            {
+              "role": "user",
+              "content": "@{triggerBody()?['task']}"
+            }
+          ],
+          "temperature": 0,
+          "response_format": {
+            "type": "json_object"
+          }
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://cognitiveservices.azure.com"
+        }
+      },
+      "runAfter": {
+        "Check_Kill_Switch": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Parse_Actor": {
+      "type": "ParseJson",
+      "inputs": {
+        "content": "@json(body('Call_Actor')?['choices']?[0]?['message']?['content'])",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "decision": {
+              "type": "string"
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "rationale": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "runAfter": {
+        "Call_Actor": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Compose_Audit_Required": {
+      "type": "Compose",
+      "description": "Gated mode audits every run. Sampled mode audits a random slice. Irreversible actions and low confidence are always audited.",
+      "inputs": "@or(or(equals(body('Parse_State')?['mode'], 'gated'), less(rand(0, 100), body('Parse_State')?['sampleRate'])), or(equals(triggerBody()?['actionClass'], 'irreversible'), less(body('Parse_Actor')?['confidence'], 0.7)))",
+      "runAfter": {
+        "Parse_Actor": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Run_Audit": {
+      "type": "If",
+      "expression": {
+        "equals": [
+          "@outputs('Compose_Audit_Required')",
+          true
+        ]
+      },
+      "actions": {
+        "Call_Auditor": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@parameters('auditorUrl')",
+            "body": {
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are an independent auditor. You did not make this decision. Check whether the decision is supported by the task and is safe to execute. Reply with JSON only, in this shape: {\"verdict\": \"pass\" or \"fail\", \"reason\": string}. Fail it if you are unsure."
+                },
+                {
+                  "role": "user",
+                  "content": "@{concat('Task: ', triggerBody()?['task'], '\nActor decision: ', body('Parse_Actor')?['decision'], '\nActor rationale: ', body('Parse_Actor')?['rationale'])}"
+                }
+              ],
+              "temperature": 0,
+              "response_format": {
+                "type": "json_object"
+              }
+            },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "identity": "@parameters('auditorIdentity')",
+              "audience": "https://cognitiveservices.azure.com"
+            }
+          },
+          "runAfter": {}
+        },
+        "Parse_Auditor": {
+          "type": "ParseJson",
+          "inputs": {
+            "content": "@json(body('Call_Auditor')?['choices']?[0]?['message']?['content'])",
+            "schema": {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "type": "string"
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "runAfter": {
+            "Call_Auditor": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Set_Verdict": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "verdict",
+            "value": "@if(and(parameters('demoMode'), not(empty(triggerBody()?['forceVerdict']))), triggerBody()?['forceVerdict'], toLower(body('Parse_Auditor')?['verdict']))"
+          },
+          "runAfter": {
+            "Parse_Auditor": [
+              "Succeeded"
+            ]
+          }
+        },
+        "Set_Verdict_Reason": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "verdictReason",
+            "value": "@body('Parse_Auditor')?['reason']"
+          },
+          "runAfter": {
+            "Set_Verdict": [
+              "Succeeded"
+            ]
+          }
+        }
+      },
+      "else": {
+        "actions": {}
+      },
+      "runAfter": {
+        "Compose_Audit_Required": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Escalate_Or_Execute": {
+      "type": "If",
+      "description": "Policy gate. Humans own irreversible actions, low confidence and failed audits.",
+      "expression": {
+        "or": [
+          {
+            "equals": [
+              "@triggerBody()?['actionClass']",
+              "irreversible"
+            ]
+          },
+          {
+            "less": [
+              "@body('Parse_Actor')?['confidence']",
+              0.7
+            ]
+          },
+          {
+            "equals": [
+              "@variables('verdict')",
+              "fail"
+            ]
+          }
+        ]
+      },
+      "actions": {
+        "Post_To_Teams": {
+          "type": "Http",
+          "inputs": {
+            "method": "POST",
+            "uri": "@parameters('teamsWebhookUrl')",
+            "body": {
+              "text": "@{concat('Agent escalation for ', triggerBody()?['workflowName'], '. Action class: ', triggerBody()?['actionClass'], '. Audit verdict: ', variables('verdict'), '. Task: ', triggerBody()?['task'], '. Proposed decision: ', body('Parse_Actor')?['decision'])}"
+            }
+          },
+          "runAfter": {}
+        },
+        "Set_Outcome_Escalated": {
+          "type": "SetVariable",
+          "inputs": {
+            "name": "outcome",
+            "value": "escalated_to_human"
+          },
+          "runAfter": {
+            "Post_To_Teams": [
+              "Succeeded"
+            ]
+          }
+        }
+      },
+      "else": {
+        "actions": {
+          "Execute_Action": {
+            "type": "Compose",
+            "description": "Replace this with the real action: an HTTP call to your ERP, ticketing or claims system.",
+            "inputs": "@body('Parse_Actor')?['decision']",
+            "runAfter": {}
+          },
+          "Set_Outcome_Executed": {
+            "type": "SetVariable",
+            "inputs": {
+              "name": "outcome",
+              "value": "auto_executed"
+            },
+            "runAfter": {
+              "Execute_Action": [
+                "Succeeded"
+              ]
+            }
+          }
+        }
+      },
+      "runAfter": {
+        "Run_Audit": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Calc_Audits": {
+      "type": "Compose",
+      "inputs": "@add(body('Parse_State')?['audits'], if(outputs('Compose_Audit_Required'), 1, 0))",
+      "runAfter": {
+        "Escalate_Or_Execute": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Calc_Disagreements": {
+      "type": "Compose",
+      "inputs": "@add(body('Parse_State')?['disagreements'], if(and(outputs('Compose_Audit_Required'), equals(variables('verdict'), 'fail')), 1, 0))",
+      "runAfter": {
+        "Calc_Audits": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Calc_Rate": {
+      "type": "Compose",
+      "inputs": "@if(greater(outputs('Calc_Audits'), 0), div(float(outputs('Calc_Disagreements')), outputs('Calc_Audits')), 0)",
+      "runAfter": {
+        "Calc_Disagreements": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Calc_Decision": {
+      "type": "Compose",
+      "description": "Hold until enough audits exist. Demote fast on a high disagreement rate. Promote slowly, only on a low rate over a full evidence window. Windows reset when they fill so old clean audits cannot hide new drift. Trust is slow to earn, quick to lose.",
+      "inputs": "@if(less(outputs('Calc_Audits'), parameters('minAudits')), 'hold', if(greater(outputs('Calc_Rate'), parameters('demoteAbove')), 'demote', if(and(greaterOrEquals(outputs('Calc_Audits'), parameters('windowAudits')), lessOrEquals(outputs('Calc_Rate'), parameters('promoteBelow'))), 'promote', 'hold')))",
+      "runAfter": {
+        "Calc_Rate": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Calc_New_Sample_Rate": {
+      "type": "Compose",
+      "description": "Promote halves the sample rate down to a floor of 5. Demote snaps back to 100.",
+      "inputs": "@if(equals(outputs('Calc_Decision'), 'promote'), max(5, div(body('Parse_State')?['sampleRate'], 2)), if(equals(outputs('Calc_Decision'), 'demote'), 100, body('Parse_State')?['sampleRate']))",
+      "runAfter": {
+        "Calc_Decision": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Update_State": {
+      "type": "Http",
+      "inputs": {
+        "method": "PUT",
+        "uri": "@{concat('https://', parameters('storageAccount'), '.table.core.windows.net/', parameters('stateTable'), '(PartitionKey=''', triggerBody()?['workflowName'], ''',RowKey=''state'')')}",
+        "headers": {
+          "Accept": "application/json;odata=nometadata",
+          "Content-Type": "application/json",
+          "x-ms-version": "2019-02-02",
+          "x-ms-date": "@{utcNow('R')}"
+        },
+        "body": {
+          "PartitionKey": "@triggerBody()?['workflowName']",
+          "RowKey": "state",
+          "mode": "@if(equals(outputs('Calc_New_Sample_Rate'), 100), 'gated', 'sampled')",
+          "sampleRate": "@outputs('Calc_New_Sample_Rate')",
+          "audits": "@if(or(not(equals(outputs('Calc_Decision'), 'hold')), greaterOrEquals(outputs('Calc_Audits'), parameters('windowAudits'))), 0, outputs('Calc_Audits'))",
+          "disagreements": "@if(or(not(equals(outputs('Calc_Decision'), 'hold')), greaterOrEquals(outputs('Calc_Audits'), parameters('windowAudits'))), 0, outputs('Calc_Disagreements'))",
+          "killSwitch": "@body('Parse_State')?['killSwitch']",
+          "lastDecision": "@outputs('Calc_Decision')",
+          "lastUpdated": "@utcNow()"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com/"
+        }
+      },
+      "runAfter": {
+        "Calc_New_Sample_Rate": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Write_Audit_Log": {
+      "type": "Http",
+      "inputs": {
+        "method": "PUT",
+        "uri": "@{concat('https://', parameters('storageAccount'), '.table.core.windows.net/', parameters('auditTable'), '(PartitionKey=''', triggerBody()?['workflowName'], ''',RowKey=''', workflow()['run']['name'], ''')')}",
+        "headers": {
+          "Accept": "application/json;odata=nometadata",
+          "Content-Type": "application/json",
+          "x-ms-version": "2019-02-02",
+          "x-ms-date": "@{utcNow('R')}"
+        },
+        "body": {
+          "PartitionKey": "@triggerBody()?['workflowName']",
+          "RowKey": "@workflow()['run']['name']",
+          "timestamp": "@utcNow()",
+          "task": "@triggerBody()?['task']",
+          "actionClass": "@triggerBody()?['actionClass']",
+          "actorDecision": "@body('Parse_Actor')?['decision']",
+          "actorConfidence": "@body('Parse_Actor')?['confidence']",
+          "actorRationale": "@body('Parse_Actor')?['rationale']",
+          "audited": "@outputs('Compose_Audit_Required')",
+          "verdict": "@variables('verdict')",
+          "verdictReason": "@variables('verdictReason')",
+          "outcome": "@variables('outcome')",
+          "sampleRateAtRun": "@body('Parse_State')?['sampleRate']",
+          "ratchetDecision": "@outputs('Calc_Decision')",
+          "newSampleRate": "@outputs('Calc_New_Sample_Rate')"
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com/"
+        }
+      },
+      "runAfter": {
+        "Update_State": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Respond": {
+      "type": "Response",
+      "kind": "Http",
+      "inputs": {
+        "statusCode": 200,
+        "body": {
+          "runId": "@{workflow()['run']['name']}",
+          "outcome": "@variables('outcome')",
+          "audited": "@outputs('Compose_Audit_Required')",
+          "verdict": "@variables('verdict')",
+          "ratchetDecision": "@outputs('Calc_Decision')",
+          "sampleRateNow": "@outputs('Calc_New_Sample_Rate')"
+        }
+      },
+      "runAfter": {
+        "Write_Audit_Log": [
+          "Succeeded"
+        ]
+      }
+    }
+  },
+  "outputs": {}
+}
